@@ -30,6 +30,7 @@
 #include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -92,6 +93,12 @@ static llvm::cl::opt<bool> clEnableScalableVectorization(
                    "target (e.g., +sve, +sve2 and/or +sme feature flags)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> clDisableArmSMETiling(
+    "iree-llvmcpu-disable-arm-sme-tiling",
+    llvm::cl::desc("Disables tiling for SME even if it is supported by the "
+                   "target (i.e., when the +sme feature flag is present)"),
+    llvm::cl::init(false));
+
 // Non-static options are used in other places.
 llvm::cl::opt<bool> clEnableTransformDialectJit(
     "iree-llvmcpu-enable-transform-dialect-jit",
@@ -113,17 +120,6 @@ enum class VectorPreProcStrategy {
   // Do not apply any vectorization pre-processing transformation.
   None
 };
-
-// NOTE: This flag is meant for testing + experimentation and should not be
-// used in deployment.
-static llvm::cl::opt<bool> clExperimentalArmForceSSVE(
-    "iree-experimental-llvmcpu-arm-force-ssve",
-    llvm::cl::desc(
-        "Controls whether to disable SME tiling when SME+SSVE are enabled "
-        "with +sme. As a result, IREE will effectively target SSVE "
-        "instead of SME. This flag is experimental and should only be "
-        "used for testing."),
-    llvm::cl::init(false));
 
 // Use this flag to override IREE's heuristics for selecting the pre-processing
 // strategy.
@@ -1184,7 +1180,11 @@ getDefaultMatmulVectorSizes(linalg::LinalgOp op, int64_t vectorSize,
                             SmallVectorImpl<bool> &scalableSizeFlags) {
   auto targetAttr = IREE::HAL::ExecutableTargetAttr::lookup(op);
   if (isX86(targetAttr)) {
-    sizes.append({8, 32, 16});
+    if (hasAVX512fFeature(targetAttr)) {
+      sizes.append({8, 32, 16});
+    } else {
+      sizes.append({1, 1, vectorSize});
+    }
     return;
   }
 
@@ -1326,7 +1326,7 @@ getMatmulVectorSizes(mlir::FunctionOpInterface entryPointFn,
   // TODO: Compute vector tile sizes using heuristics.
 
   if (isAArch64(targetAttr)) {
-    if (clEnableScalableVectorization && !clExperimentalArmForceSSVE &&
+    if (clEnableScalableVectorization && !clDisableArmSMETiling &&
         hasSMEFeature(targetAttr)) {
       // Note: This may not pick any sizes (which will fallback to the scalable
       // vectorization heuristics below).
@@ -1589,10 +1589,7 @@ static TileSizesListType getMmt4dTileSizes(linalg::LinalgOp op) {
   SmallVector<int64_t> reductionTileSizes;
   splitParallelAndReductionTiles(op, parallelTileSizes, reductionTileSizes);
 
-  SmallVector<int64_t> vectorInnerParallelTileSizes(numLoops, 0);
-  return {distTileSizes,           cacheParallelTileSizes,
-          cacheReductionTileSizes, parallelTileSizes,
-          reductionTileSizes,      vectorInnerParallelTileSizes};
+  return {distTileSizes, parallelTileSizes, reductionTileSizes};
 }
 
 /// Sets the lowering configuration for dispatch region for linalg.mmt4d
@@ -2038,7 +2035,8 @@ static void getTransposeAArch64VectorSizes(
   if (failed(elementType))
     return;
 
-  if (hasSMEFeature(targetAttr) && clEnableScalableVectorization) {
+  if (hasSMEFeature(targetAttr) && clEnableScalableVectorization &&
+      !clDisableArmSMETiling) {
     if (elementType->isF32()) {
       sizes.append({4, 4});
     } else if (elementType->isF64()) {
