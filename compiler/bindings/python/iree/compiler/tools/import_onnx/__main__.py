@@ -25,15 +25,21 @@ from .importer_externalization_overrides import *
 
 
 def main(args: argparse.Namespace):
-    model_proto = load_onnx_model(args)
+    model_proto = onnx.load(args.input_file, load_external_data=False)
     context = Context()
     model_info = onnx_importer.ModelInfo(model_proto)
     m = model_info.create_module(context=context).operation
-
+    model_path = Path(args.input_file).parent
     imp: Any = None
     if args.externalize_params:
+        default_param_path = Path(args.output_file).parent / Path(args.output_file).stem
+        param_path = (
+            (str(default_param_path) + "_params.irpa")
+            if args.save_params_to is None
+            else args.save_params_to
+        )
         imp = IREENodeImporter.define_function(
-            model_info.main_graph, m, args.numel_threshold
+            model_info.main_graph, m, args.numel_threshold, param_path, model_path
         )
     else:
         imp = onnx_importer.NodeImporter.define_function(model_info.main_graph, m)
@@ -42,14 +48,8 @@ def main(args: argparse.Namespace):
     if not args.no_verify:
         m.verify()
 
-    if args.externalize_params:
-        default_param_path = Path(args.output_file).parent / Path(args.output_file).stem
-        param_path = (
-            (str(default_param_path) + "_params.irpa")
-            if args.save_params_to is None
-            else args.save_params_to
-        )
-        imp.param_archive.create_archive_file(param_path)
+    if args.externalize_params and imp.curr_param_buffer_size > 0:
+        imp.param_archive.create_archive_file(imp.param_path)
 
     # TODO: This isn't very efficient output. If these files ever
     # get large, enable bytecode and direct binary emission to save

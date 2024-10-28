@@ -3,6 +3,8 @@ import random
 import string
 import iree.runtime as rt
 
+from pathlib import Path
+
 from ...dialects import util
 from typing import Optional, Tuple, Any
 
@@ -50,6 +52,8 @@ class IREENodeImporter(onnx_importer.NodeImporter):
         module_op: Operation,
         module_cache: "onnx_importer.ModuleCache",
         numel_threshold: int,
+        param_path: str,
+        model_path: Path,
     ):
         super().__init__(
             graph_info,
@@ -64,6 +68,10 @@ class IREENodeImporter(onnx_importer.NodeImporter):
         self.symbol_table.insert(parent_op)
         self.numel_threshold = numel_threshold
         self.param_archive = rt.ParameterIndex()
+        self.param_archive.reserve(1024000)
+        self.curr_param_buffer_size = 0
+        self.param_path = param_path
+        self.model_path = model_path
 
     def sanitize_name(self, name: str) -> str:
         # There are often some initializers in the models that have no name
@@ -131,6 +139,8 @@ class IREENodeImporter(onnx_importer.NodeImporter):
         graph_info: onnx_importer.GraphInfo,
         module_op: Operation,
         numel_threshold: int,
+        param_path: str,
+        model_path: Path,
         context_cache: Optional["onnx_importer.ContextCache"] = None,
         module_cache: Optional["onnx_importer.ModuleCache"] = None,
         private: bool = False,
@@ -173,6 +183,8 @@ class IREENodeImporter(onnx_importer.NodeImporter):
             module_op=module_op,
             module_cache=mc,
             numel_threshold=numel_threshold,
+            param_path=param_path,
+            model_path=model_path,
         )
         for node_name, input_value in zip(graph_info.input_map.keys(), block.arguments):
             imp._nv_map[node_name] = input_value
@@ -208,8 +220,15 @@ class IREENodeImporter(onnx_importer.NodeImporter):
             ).result
 
         self._nv_map[iname] = converted_value
-        tensor_as_array = numpy_helper.to_array(initializer)
+        tensor_as_array = numpy_helper.to_array(initializer, str(self.model_path))
         self.param_archive.add_buffer(x, tensor_as_array)
+        self.curr_param_buffer_size += 1
+        # TODO(vinayakdsci): Add max buffer size before writing
+        # to the param_archive as a flag to the argparser.
+        if self.curr_param_buffer_size == 300:
+            self.param_archive = self.param_archive.create_archive_file(self.param_path)
+            print(self.param_archive)
+            self.curr_param_buffer_size -= 300
         return converted_value
 
 
